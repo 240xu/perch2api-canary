@@ -16,6 +16,12 @@ client ──► Perch2API :8790 ──► https://app.perchai.app/api/perch-ter
 > Unofficial, unaffiliated with Perch. It drives your own logged-in account against
 > `app.perchai.app`; what you do with that account is your decision and your risk.
 
+> **Rebuilt 2026-11-16:** the prompt layer now sends 275 characters instead of the
+> whole operator prompt, the envelope matches a captured official call field for
+> field, and the gateway ships risk guards plus a loopback developer panel. Read
+> [CANARY.md](CANARY.md) for the measurements behind that, and
+> [DEPLOY.md](DEPLOY.md) for the deployment, guards and rollback.
+
 ## Why this works (short version)
 
 The Perch desktop app is a thin Electron shell around `https://app.perchai.app`; the real

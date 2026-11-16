@@ -85,18 +85,25 @@ async function main() {
   server.close();
 
   console.log('[3/4] exchanging code for a session');
-  const tokenRes = await fetch(`${cfg.supabaseUrl}/auth/v1/token?grant_type=pkce`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      apikey: cfg.supabaseAnonKey,
-      Authorization: `Bearer ${cfg.supabaseAnonKey}`,
-    },
-    body: JSON.stringify({ auth_code: code, code_verifier: verifier }),
+  const tokenBase = process.env.PERCH_SUPABASE_PROXY || cfg.supabaseUrl;
+  const tokenUrl = `${tokenBase}/auth/v1/token?grant_type=pkce`;
+  const payload = JSON.stringify({ auth_code: code, code_verifier: verifier });
+  const raw = await new Promise((resolve, reject) => {
+    execFile('curl', [
+      '-sS', '--max-time', '90', '-X', 'POST', tokenUrl,
+      '-H', 'Content-Type: application/json',
+      '-H', `apikey: ${cfg.supabaseAnonKey}`,
+      '-H', `Authorization: Bearer ${cfg.supabaseAnonKey}`,
+      '--data-binary', payload,
+    ], { maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(`token exchange curl failed: ${err.message} ${stderr || ''}`.trim()));
+      else resolve(stdout);
+    });
   });
-  const session = await tokenRes.json().catch(() => null);
-  if (!tokenRes.ok || !session?.access_token) {
-    throw new Error(`token exchange failed: HTTP ${tokenRes.status} ${session?.error_description || session?.error || ''}`.trim());
+  let session = null;
+  try { session = JSON.parse(raw); } catch { /* non-JSON response */ }
+  if (!session?.access_token) {
+    throw new Error(`token exchange failed: ${raw.slice(0, 300)}`);
   }
 
   const record = {
@@ -137,7 +144,7 @@ function waitForCode(server) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error('timed out waiting for the OAuth callback'));
-    }, 300_000);
+    }, 900_000);
 
     server.on('request', (req, res) => {
       const url = new URL(req.url, 'http://127.0.0.1');

@@ -8,6 +8,7 @@ accounts/
 api-key*
 # Gate prefix derived from your own Perch install (see scripts/extract-prefix.mjs)
 .perch-prefix.txt
+.perch-prompt-agents.txt
 
 # Runtime
 logs/

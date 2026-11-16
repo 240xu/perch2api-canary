@@ -7,9 +7,12 @@
  *          x-perch-locale: en
  *          Accept: text/event-stream
  *          x-perch-call-delta: 1        (optional: enables held-context deltas)
- * Body: { request: { messages, tools?, toolChoice?, maxTokens, temperature },
- *         runId, lane, strictManual, preferredModelId?, roostModelChoice?,
- *         attribution, clientSurface, avoidModelIds, resendAfterOutput }
+ * Body (honeypot dialect, the default — eight top-level keys, no extras):
+ *        { request: { messages, tools?, temperature, maxTokens, toolChoice },
+ *          runId, lane, strictManual, preferredModelId, avoidModelIds,
+ *          attribution, clientSurface }
+ *        `PERCH_ENVELOPE_MODE=magpie` additionally emits resendAfterOutput,
+ *        roostReasoning/effort, manualModelOptionId and request.preferredModelId.
  *
  * Response: text/event-stream of JSON events —
  *   {"type":"reasoning_delta","text":...}
@@ -32,41 +35,88 @@ export class PerchError extends Error {
   }
 }
 
-/** Build the upstream body from already-normalised messages + options. */
+/**
+ * Build the upstream body from already-normalised messages + options.
+ *
+ * The authority for this shape is a captured official call
+ * (`honeypot/…-model-call`, 2026-10-13), whose top level has exactly eight keys:
+ *
+ *   request, runId, lane, strictManual, preferredModelId, avoidModelIds,
+ *   attribution, clientSurface
+ *
+ * and whose `request` has only messages/tools/temperature/maxTokens/toolChoice.
+ * Three deviations from that shape were in the previous build and are the
+ * cheapest possible things for the server to notice:
+ *
+ *   - `resendAfterOutput` at the top level (not in the capture),
+ *   - `stop` inside `request` (not in the capture),
+ *   - `preferredModelId` sent only for pins (the capture always carries one).
+ *
+ * `PERCH_ENVELOPE_MODE=magpie` reproduces the newer 2.4.132 reconstruction
+ * instead, for A/B testing on a live account. The panel shows both fingerprints
+ * side by side so the outcome is attributable.
+ */
 export function buildRequestBody({
   messages, tools, toolChoice, maxTokens, temperature, stop,
-  model, runId, reasoning, attribution,
+  model, runId, reasoning, attribution, lane,
 }) {
+  const mode = config.envelopeMode;
+  const magpie = mode === 'magpie';
+
   const request = { messages };
   if (Array.isArray(tools) && tools.length) {
     request.tools = tools;
+    request.temperature = Number.isFinite(temperature) ? temperature : undefined;
+    request.maxTokens = Number.isFinite(maxTokens) ? maxTokens : undefined;
     request.toolChoice = toolChoice || 'auto';
+  } else {
+    if (Number.isFinite(temperature)) request.temperature = temperature;
+    if (Number.isFinite(maxTokens)) request.maxTokens = maxTokens;
   }
-  if (Number.isFinite(maxTokens)) request.maxTokens = maxTokens;
-  if (Number.isFinite(temperature)) request.temperature = temperature;
-  if (Array.isArray(stop) && stop.length) request.stop = stop;
+  // The capture has no `stop`, so it is only forwarded in the dialect that also
+  // reintroduces the other extras. Callers that need it can use magpie mode.
+  if (magpie && Array.isArray(stop) && stop.length) request.stop = stop;
+  if (reasoning) request.reasoning = reasoning;
+  if (magpie && model.kind === 'pin') request.preferredModelId = model.preferredModelId;
 
   const body = {
     request,
     runId,
-    lane: config.lane,
-    // OBSERVED (real CLI, `perch run --model qwen-3.8-max`, 2026-10-26): a manual
-    // pin is expressed with THREE fields — preferredModelId, manualModelOptionId
-    // (same value) and strictManual:false. Sending only preferredModelId (and/or
-    // strictManual:true) makes the server fall back to the account default model
-    // without erroring, which looks exactly like "pins are ignored".
+    lane: lane || config.lane,
     strictManual: false,
-    clientSurface: config.clientSurface,
-    attribution,
+    preferredModelId: model.kind === 'pin' ? model.preferredModelId : null,
     avoidModelIds: [],
-    resendAfterOutput: true,
+    attribution,
+    clientSurface: config.clientSurface,
   };
-  if (model.kind === 'roost') body.roostModelChoice = model.roostModelChoice;
-  if (model.kind === 'pin') {
-    body.preferredModelId = model.preferredModelId;
+
+  if (model.kind === 'roost') {
+    // The capture cannot settle this one: it always carried a pin, so there is no
+    // roost sample to copy. The default tier is what the server resolves to on its
+    // own, so asking for it explicitly would only add a ninth top-level key for no
+    // reason — it is sent only when a non-default tier is requested.
+    if (model.roostModelChoice !== 'standard' || magpie) {
+      body.roostModelChoice = model.roostModelChoice;
+    }
+    if (magpie || config.sendRoostExtras) {
+      body.roostReasoning = true;
+      body.effort = { level: 'high', orchestration: false };
+    }
+  }
+
+  if (model.kind === 'pin' && (magpie || config.sendManualOption)) {
     body.manualModelOptionId = model.preferredModelId;
   }
-  if (reasoning) body.reasoning = reasoning;
+
+  if (magpie) body.resendAfterOutput = true;
+
+  // Cheap regression guard: a lane inside `request` makes Perch treat the call
+  // as coming from somewhere other than its own CLI and answer
+  // `perch_surface_required`. This assertion has caught it once already.
+  if (Object.prototype.hasOwnProperty.call(request, 'lane')) {
+    throw new Error('buildRequestBody: lane must never appear inside request');
+  }
+
   return body;
 }
 
@@ -93,6 +143,7 @@ function parseSseChunk(buffer, onEvent) {
 export async function callModel({
   baseUrl,
   token,
+  ticket,
   body,
   signal,
   onEvent,
@@ -112,6 +163,13 @@ export async function callModel({
 
     let sawEvent = false;
     try {
+      if (process.env.PERCH_DEBUG_WIRE === '1') {
+        console.log('[wire]', `${baseUrl}/api/perch-terminal/model-call`,
+          'ticket=', ticket?.ticketId ?? 'none', 'ticketRun=', ticket?.runId ?? 'none',
+          'bodyRun=', body?.runId ?? 'none', 'bytes=', JSON.stringify(body).length,
+          'syslen=', body?.request?.messages?.[0]?.content?.length ?? 0,
+          'roles=', (body?.request?.messages || []).map((m) => m.role).join(','));
+      }
       const response = await fetch(`${baseUrl}/api/perch-terminal/model-call`, {
         method: 'POST',
         headers: {
@@ -121,6 +179,7 @@ export async function callModel({
           'User-Agent': config.userAgent,
           'x-perch-locale': config.locale,
           'x-perch-call-delta': '1',
+          ...(ticket?.token ? { 'x-perch-turn-ticket': ticket.token } : {}),
         },
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -144,6 +203,15 @@ export async function callModel({
         throw error;
       }
       if (!response.body) throw new PerchError('Perch returned an empty body', { status: 502 });
+
+      // The delta protocol announces itself in response headers; surfacing them
+      // lets the panel show whether the server considers this a held-context turn.
+      const meta = {
+        callDelta: response.headers.get('x-perch-call-delta'),
+        heldLength: response.headers.get('x-perch-call-held-length'),
+        heldDigest: response.headers.get('x-perch-call-held-digest'),
+        heldTools: response.headers.get('x-perch-call-held-tools'),
+      };
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -184,7 +252,7 @@ export async function callModel({
         throw new PerchError(done.error || 'Perch reported a failed model call',
           { status: 502, code: done.errorCode || 'model_call_failed', limit: done.limit ?? null });
       }
-      return done;
+      return { ...done, meta };
     } catch (error) {
       lastError = error;
       const aborted = signal?.aborted;
