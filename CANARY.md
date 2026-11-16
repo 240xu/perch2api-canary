@@ -67,41 +67,66 @@ The shape changed twice. Two independent captures, both real:
 | CLI version | top-level keys | source |
 |---|---|---|
 | 2.4.108 (2026-10-13, honeypot) | **8** | a honeypot that received real client traffic |
-| 2.4.130 / 2.4.134 (2026-11-16, this rebuild) | **12 (ask) / 9 (agents)** | `perchai-cli` installed and driven against a local recorder |
+| 2.4.130 / 2.4.134 (2026-11-16, this rebuild) | **9 bare, 12 with `--effort`, 13 with a pin** | `perchai-cli` installed and driven against a local recorder |
 
 The 8-key shape — `request, runId, lane, strictManual, preferredModelId,
 avoidModelIds, attribution, clientSurface` — is the **old** one. It is kept in this
 tree as `PERCH_ENVELOPE_MODE=honeypot` because it was the only thing measured for a
 long time, but it is not what a current client sends.
 
-Current 2.4.134, measured key by key:
+Current 2.4.134, measured key by key. **The key count is driven by one thing: whether
+the CLI was invoked with `--effort`.** It is not a per-lane difference — that was an
+early misreading of ours, corrected by the 2×2 below.
 
 ```
-ask    (12): attribution, avoidModelIds, clientSurface, effort, lane,
-             preferredModelId, request, resendAfterOutput, roostModelChoice,
-             roostReasoning, runId, strictManual
-agents (9):  attribution, avoidModelIds, clientSurface, lane, preferredModelId,
-             request, resendAfterOutput, runId, strictManual
+default (no --effort)  (9):  request, runId, lane, strictManual, preferredModelId,
+                             avoidModelIds, attribution, clientSurface,
+                             resendAfterOutput
+with --effort <level> (12):  … the nine above, plus
+                             roostModelChoice, roostReasoning, effort
+with --model <pin>    (13):  … plus manualModelOptionId
 ```
 
-`request` in **ask** is `{messages, temperature, maxTokens}`; in **agents** it is
-`{messages, tools, temperature, maxTokens, toolChoice}` (63 tools). Observed values:
-`temperature: 0.6`, `maxTokens: 32000`, `preferredModelId: null`, `resendAfterOutput:
-true`, `lane: "chat"`, `strictManual: false`, `attribution: null`, `clientSurface:
-"cli"`, `avoidModelIds: []`, `effort: {level: "off", orchestration: false}`,
-`roostModelChoice: "standard"`, `roostReasoning: false`.
+Note the key order: `resendAfterOutput` sits **before** `roostModelChoice`, not after
+`clientSurface`-adjacent extras. Order is stable across captures.
+
+The 2×2 that settles it (`--effort` × lane), each cell a real capture:
+
+| invocation | keys | `effort` | `roost*` | `tools` |
+|---|---|---|---|---|
+| `--mode ask` (no effort) | 9 | absent | absent | none |
+| `--mode ask --effort off` | 12 | present | present | none |
+| `--mode agents` (no effort) | 9 | absent | absent | 63 |
+| `--mode agents --effort off` | 12 | present | present | 63 |
+| `--mode ask --effort off --model pro` | 12 | present | present (`roostModelChoice: "pro"`) | none |
+| `--mode ask --model gpt-6.1-sol --effort off` | 13 | present | present | none |
+| `--mode ask --model gpt-6.1-sol` (no effort) | 10 | absent | absent | none |
+
+So `roostModelChoice` / `roostReasoning` / `effort` appear or vanish together, and the
+trigger is the flag, not the lane and not the model pin. `roostReasoning` is derived:
+it is `effort.level !== "off"`.
+
+`request` is `{messages, temperature, maxTokens}` in ask and adds `{tools, toolChoice}`
+in agents. Observed values: `temperature: 0.6`, `maxTokens: 32000` (both hardcoded in
+the bundle), `preferredModelId: null` (**also `null` when a model is pinned** — the pin
+travels in `manualModelOptionId`), `resendAfterOutput: true`, `lane: "chat"`,
+`strictManual: false`, `attribution: null`, `clientSurface: "cli"`, `avoidModelIds: []`,
+`effort: {level: "off", orchestration: false}`, `roostModelChoice: "standard"`,
+`roostReasoning: false`.
 
 Four things a naive implementation gets wrong, all of them trivially detectable:
 
 1. `lane` inside `request` — it belongs beside `request`, and putting it inside is
-   itself treated as evidence the call did not come from the official client. The
-   official body never carries it there.
-2. `preferredModelId` sent only when a model is pinned — the official body always
-   carries one, `null` included.
-3. Treating `resendAfterOutput` as a leftover. It is absent in 2.4.108 and present
-   from somewhere before 2.4.130; shipping a body without it is shipping an old
-   version's body. `PERCH_ENVELOPE_MODE=magpie` emits the modern shape.
-4. `tools` / `toolChoice` in ask mode. The official ask lane sends **neither**.
+   itself treated as evidence the call did not come from the official client. Measured:
+   `request` contains `lane` 0 times in 14 captures, as do `stop` and `reasoning`.
+2. `preferredModelId` sent only when a model is pinned — the official body **always**
+   carries the key, `null` included, and a pin does **not** populate it. Putting the
+   pinned model id there is a tell.
+3. Treating `resendAfterOutput` as a leftover. It is absent in 2.4.108, and present from
+   **2.4.114** onward (bisected: 2.4.113 no, 2.4.114 yes). Shipping a body without it is
+   shipping a pre-2.4.114 body. `PERCH_ENVELOPE_MODE=magpie` emits the modern shape.
+4. `tools` / `toolChoice` in ask mode. The official ask lane sends **neither**, because
+   ask has no tools — not because they were filtered.
 
 `node scripts/inspect-body.mjs --all` prints every mode offline.
 
@@ -141,6 +166,39 @@ This gateway makes **one** request (`model-call`). That is a deliberate trade: n
 official client by roughly 9×, which is a permanent, visible deviation — the panel's
 red-line tab shows it.
 
+### The second `model-call`, and the delta protocol
+
+The nine requests above are one *first* model-call. When the answer contains tool
+calls, the client issues **another** `model-call` for the continuation, and from
+**2.4.111** onward it does not resend the conversation. It sends:
+
+```
+messagesDelta: { baseLength, baseDigest, newMessages }
+toolsDigest:   <hash>
+```
+
+and drops `request.messages` and `request.tools` entirely. Measured size difference
+on the same conversation: **1,065 bytes incremental vs 116,057 bytes full**.
+
+This matters for two reasons. First, a gateway that always sends full `messages` on
+every call has a shape the official client has not had since 2.4.111 — the payload
+size alone distinguishes it. Second, the held-delta header is optional and the client
+degrades gracefully without it, so **not** implementing the delta protocol costs
+nothing on the wire; always sending full messages is the part that differs.
+
+### Version chronology
+
+| version | change |
+|---|---|
+| 2.4.108 | the 8-key shape (what the honeypot caught) |
+| **2.4.111** | delta protocol (`messagesDelta` + `toolsDigest`) |
+| ≤2.4.113 | no `resendAfterOutput` |
+| **2.4.114** | `resendAfterOutput` appears |
+| 2.4.130 → 2.4.134 | ask body byte-identical; agents prompt −193 chars (one skill line), agent model list +`gemini-4-hydrogen` |
+
+The honeypot capture was not wrong. It was correct for 2.4.108, which on 2026-10-13 was
+the current release. It has simply been frozen for 26 versions since.
+
 ## 5. Honest limits
 
 **The gate is not the whole story, and this tree got the story backwards for a while.**
@@ -150,7 +208,9 @@ sends `messages = [system, user]` where the system message is **27,880 character
 beginning `You are Saffron — Perch's workspace operator.` The official client does
 not send a 275-character paragraph. It sends the whole prompt, every turn.
 
-The prompt is generated, not shipped. Two lines in it are filled at runtime:
+The prompt is generated, not shipped. The bundle carries a **static template** and the
+client fills in the rest at runtime — measured at **91.7% static / 8.3% runtime**. Only
+two lines vary by machine and day:
 
 ```
 Workspace root: <cwd>
@@ -158,13 +218,18 @@ Today is <weekday>, <month> <day>, <year> (<iso-date>). Use this for date
 calculations when scheduling or referencing time.
 ```
 
-Measured sizes, same client, same machine, one variable — the lane:
+Measured sizes, same client, same machine:
 
-| mode | system prompt | `tools` | top-level keys |
+| mode | system prompt | `tools` | keys (with `--effort`) |
 |---|---|---|---|
 | `ask` | 27,880 | none | 12 |
-| `agents` | 43,520 | 63 | 9 |
+| `agents` | 43,520 | 63 | 12 |
 | `ask` (2.4.108, 2026-10-13) | 37,469 | none | 8 |
+
+Substituting this machine's cwd for `/home/ova` makes our 27,815-character Ask file
+**byte-identical** to what the client sent (`sha256 84a02b59…`). It is the genuine
+article, not a reconstruction — that file is trustworthy; the 51,887-character Agents
+file is not (it is 2.4.108, from a capture 26 versions old).
 
 So the two claims have to be separated:
 
@@ -175,25 +240,30 @@ So the two claims have to be separated:
 
 This tree implements the first, not the second. That is a real deviation and it is
 the most likely explanation for how this account died: not the prompt length in
-isolation, but a body that is one-ninth the official request count, one request
-instead of nine, missing three `cli-context` calls, and ~100× shorter than the
-operator prompt the client always ships.
+isolation, but a body that is one request instead of nine, missing three `cli-context`
+calls, always sending full `messages` where the client has sent deltas since 2.4.111,
+carrying a pre-2.4.114 envelope, and ~100× shorter than the operator prompt the client
+always ships.
 
 What would close the gap, in order of how much it changes:
 
-1. Send the full operator prompt (`PERCH_PROMPT_MODE=full`), not the canary.
-2. Send `cli-context` before `model-call`, as the client does.
-3. Change `PERCH_ENVELOPE_MODE` to match the CLI version being compared.
-4. Optionally report `cli-turn` — and accept that it uploads the whole conversation.
+1. Send the full operator prompt (`PERCH_PROMPT_MODE=full`), not the canary. The canary
+   paragraph is the one thing guaranteed to be in *every* official body, which makes a
+   body containing only it maximally distinctive rather than minimally.
+2. Send `cli-context` (three times) before `model-call`, as the client does.
+3. Set `PERCH_ENVELOPE_MODE=magpie`. `honeypot` reproduces 2.4.108.
+4. Emit `manualModelOptionId` when a model is pinned, and leave `preferredModelId: null`.
+5. Optionally report `cli-turn` — and accept that it uploads the whole conversation.
 
 None of those is a fix for a ban, and none of them is tested: the account available
 to this rebuild was already banned, so `inspect-body` can prove the body is *shaped*
 right, not that the server will answer 200.
 
 **A trap worth naming:** if you build the "full prompt" from an old capture, you get
-an old prompt. This tree's reference files came from a 2026-10-13 capture of
-2.4.108 — the day-of-week line and the plan copy have both changed since. Diff your
-own extract against a live `perch run` before trusting its length.
+an old prompt. This tree's Agents file came from a 2026-10-13 capture of 2.4.108 and is
+8,367 characters longer than what 2.4.134 sends. The Ask file checked out byte-for-byte
+only because the Ask template did not change in that window — do not generalise from
+that. Diff your own extract against a live `perch run` before trusting its length.
 
 - None of this makes the traffic sanctioned. Perch's own policy text says internal
   application endpoints are not a public API. The guards in this tree reduce the
