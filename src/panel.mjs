@@ -275,6 +275,30 @@ const PAGE = `<!doctype html>
     </div>
     <h2>envelope 对照表</h2>
     <table><thead><tr><th>指纹</th><th>200</th><th>403</th><th>429</th><th>其它</th><th>最后状态</th><th>最后时间</th></tr></thead><tbody id="dg-env"></tbody></table>
+
+    <h2>多模式矩阵</h2>
+    <div class="card">
+      <div class="dim" style="margin-bottom:8px">
+        每一格是一次真实上游调用。预览免费；实跑会在发号前先判封，封号则一格都不发。
+        格间强制间隔，避免把探针打成扫描。
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <label>提示词 <select id="mx-modes" multiple size="6"></select></label>
+        <label>envelope <select id="mx-env" multiple size="2"></select></label>
+        <label>lane <select id="mx-lane" multiple size="3"></select></label>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <label>间隔 <input id="mx-gap" type="number" value="30" min="1" max="300" style="width:60px"> 秒</label>
+        <label>上限 <input id="mx-limit" type="number" value="4" min="1" max="24" style="width:60px"> 格</label>
+        <label>提示词 <input id="mx-prompt" value="Reply with exactly one word: PONG" style="width:320px"></label>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <button class="act" id="mx-preview">预览（免费）</button>
+        <button class="act" id="mx-run">实跑</button>
+        <span id="mx-status" class="dim"></span>
+      </div>
+      <div id="mx-out"></div>
+    </div>
   </section>
 
   <section id="redline">
@@ -532,11 +556,98 @@ $('btn-ban').onclick = async () => { try { $('dg-acc').textContent = JSON.string
 $('btn-plan').onclick = async () => { try { $('dg-acc').textContent = JSON.stringify(await api('/api/check-plan', { method: 'POST' }), null, 2); } catch (e) { $('dg-acc').textContent = '失败：' + e.message; } };
 $('btn-heal').onclick = async () => { try { $('dg-acc').textContent = JSON.stringify(await api('/api/select-plan', { method: 'POST' }), null, 2); } catch (e) { $('dg-acc').textContent = '失败：' + e.message; } };
 
+// --- multi-mode matrix ------------------------------------------------------
+// This block lives inside the page's template literal, so it must not contain
+// backticks or dollar-brace interpolation: the server would expand them before the
+// browser sees the script. Everything below is built with string concatenation.
+const mxSel = (id, values, selected) => {
+  const el = $(id);
+  el.innerHTML = values.map((v) => '<option value="' + esc(v) + '"'
+    + (selected.includes(v) ? ' selected' : '') + '>' + esc(v) + '</option>').join('');
+};
+const mxPicked = (id) => [...$(id).selectedOptions].map((o) => o.value);
+
+async function mxInit() {
+  try {
+    const s = await api('/api/state');
+    const p = s.prompt || {};
+    mxSel('mx-modes', p.modes || ['canary'], [p.mode || 'canary']);
+    mxSel('mx-env', ['honeypot', 'magpie'], [s.envelopeMode || 'magpie']);
+    mxSel('mx-lane', ['chat', 'code', 'worker'], [s.lane || 'chat']);
+    $('mx-status').textContent = 'ask ' + (p.fullChars || 0) + ' 字 / agents '
+      + (p.agentsChars || 0) + ' 字 / 当前 ' + (p.mode || '?');
+  } catch (e) {
+    $('mx-status').textContent = '读取状态失败：' + e.message;
+  }
+}
+
+function mxRender(payload) {
+  const rows = payload.dry ? payload.cells : (payload.results || []);
+  if (!rows.length) {
+    let why = payload.stopReason ? '未发起调用：' + payload.stopReason : '没有可执行的格';
+    if (payload.missing && payload.missing.length) why += '（缺提示词文件：' + payload.missing.join('、') + '）';
+    $('mx-out').innerHTML = '<pre class="dim">' + esc(why) + '</pre>';
+    return;
+  }
+  let html;
+  if (payload.dry) {
+    html = '<table><thead><tr><th>格</th><th>system 字</th><th>顶层键</th><th>字节</th><th>request 键</th></tr></thead><tbody>'
+      + rows.map((r) => '<tr><td>' + esc(r.id) + '</td><td>' + r.sysLen + '</td><td>' + r.topKeys
+        + '</td><td>' + r.bodyBytes + '</td><td class="dim">' + esc((r.requestKeys || []).join(',')) + '</td></tr>').join('')
+      + '</tbody></table><div class="dim" style="margin-top:6px">共 ' + payload.planned + ' 格，预览未发任何调用。</div>';
+  } else {
+    const cls = (r) => (r.status === 200 ? 'ok' : (r.category === 'banned' ? 'err' : 'warn'));
+    html = '<table><thead><tr><th>格</th><th>结果</th><th>分类</th><th>耗时</th><th>详情</th></tr></thead><tbody>'
+      + rows.map((r) => '<tr><td>' + esc(r.id) + '</td><td class="' + cls(r) + '">' + (r.status || 'ERR')
+        + '</td><td>' + esc(r.category || '—') + '</td><td>' + (r.ms == null ? '—' : r.ms + 'ms')
+        + '</td><td class="dim">' + esc(r.errorCode || r.error || r.transportError || '') + '</td></tr>').join('')
+      + '</tbody></table>'
+      + (payload.stopReason ? '<div class="pill err" style="margin-top:6px">提前停止：' + esc(payload.stopReason) + '</div>' : '');
+  }
+  $('mx-out').innerHTML = html;
+}
+
+$('mx-preview').onclick = async () => {
+  $('mx-status').textContent = '预览中…';
+  try {
+    const p = await api('/api/matrix', { method: 'POST', body: JSON.stringify({
+      dry: true, modes: mxPicked('mx-modes'), envelopes: mxPicked('mx-env'),
+      lanes: mxPicked('mx-lane'), prompt: $('mx-prompt').value,
+    }) });
+    mxRender(p);
+    $('mx-status').textContent = '预览 ' + p.planned + ' 格，未发调用';
+  } catch (e) { $('mx-status').textContent = '失败：' + e.message; }
+};
+
+$('mx-run').onclick = async () => {
+  const lanes = mxPicked('mx-lane');
+  const modes = mxPicked('mx-modes');
+  const envs = mxPicked('mx-env');
+  const total = modes.length * envs.length * lanes.length;
+  const cap = Number($('mx-limit').value) || 4;
+  const n = Math.min(total, cap);
+  const secs = (Number($('mx-gap').value) || 30) * Math.max(0, n - 1);
+  const msg = '即将发起最多 ' + n + ' 次真实上游调用，间隔 ' + $('mx-gap').value
+    + 's，约需 ' + secs + 's。\n\n每格都会真实计费并留下服务端记录。继续？';
+  if (!confirm(msg)) return;
+  $('mx-status').textContent = '实跑中…（不要关页面）';
+  try {
+    const p = await api('/api/matrix', { method: 'POST', body: JSON.stringify({
+      dry: false, modes, envelopes: envs, lanes, prompt: $('mx-prompt').value,
+      gapMs: (Number($('mx-gap').value) || 30) * 1000, limit: cap,
+    }) });
+    mxRender(p);
+    $('mx-status').textContent = p.stopReason ? '已停止：' + p.stopReason : '完成 ' + p.results.length + ' 格';
+  } catch (e) { $('mx-status').textContent = '失败：' + e.message; }
+};
+
+
 loadState().catch((e) => { document.body.insertAdjacentHTML('afterbegin', '<div class="card err">' + esc(e.message) + '</div>'); });
 loadFlow().catch(() => {});
 loadEnvelopes().catch(() => {});
 loadRedline().catch(() => {});
 initDiag().catch(() => {});
+mxInit();
 connect();
 setInterval(() => { loadState().catch(() => {}); }, 5000);
 setInterval(() => { if (document.getElementById('redline').classList.contains('active')) loadRedline().catch(() => {}); }, 5000);
@@ -549,14 +660,19 @@ export async function startPanel({ state, store, guardState, config: cfg }) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
-    if (route === '/' || route === '/index.html') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(PAGE);
+    // The page itself is gated too. It used to be served before the key check, which
+    // meant anyone who could reach the port got the full UI (tab names, field names,
+    // endpoint list) even though the API behind it said 401. The panel is meant to be
+    // loopback-only, so an unauthenticated page request is a misconfiguration worth
+    // reporting rather than accommodating.
+    if (!authorized(req, url)) {
+      json(res, 401, { error: 'missing or invalid key (append ?k=<PERCH2API_KEY>)' });
       return;
     }
 
-    if (!authorized(req, url)) {
-      json(res, 401, { error: 'missing or invalid key (append ?k=<PERCH2API_KEY>)' });
+    if (route === '/' || route === '/index.html') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(PAGE);
       return;
     }
 
@@ -607,6 +723,148 @@ export async function startPanel({ state, store, guardState, config: cfg }) {
 
       if (req.method === 'GET' && route === '/api/envelopes') {
         json(res, 200, { data: Object.fromEntries(stats.envelopes) });
+        return;
+      }
+
+      // Multi-mode matrix. Preview is free; run spends real calls, so it refuses to
+      // start when the account is unusable and honours the same spacing as the CLI
+      // probe. Kept here rather than shelling out so the panel has no exec surface.
+      if (req.method === 'POST' && route === '/api/matrix') {
+        const body = await readBody(req);
+        const modes = Array.isArray(body?.modes) && body.modes.length ? body.modes : [config.promptMode];
+        const envelopes = Array.isArray(body?.envelopes) && body.envelopes.length ? body.envelopes : [config.envelopeMode];
+        const lanes = Array.isArray(body?.lanes) && body.lanes.length ? body.lanes : [config.lane];
+        const dry = body?.dry !== false;
+        const gapMs = Math.max(1000, Number(body?.gapMs) || 30_000);
+        const limit = Math.min(24, Math.max(1, Number(body?.limit) || modes.length * envelopes.length * lanes.length));
+
+        const cells = [];
+        for (const mode of modes) {
+          for (const envelopeMode of envelopes) {
+            for (const lane of lanes) {
+              const r = inspect({ mode, lane, envelopeMode, userText: body?.prompt || 'Reply with exactly one word: PONG' });
+              cells.push({
+                id: `${mode}/${envelopeMode}/${lane}`,
+                mode, envelopeMode, lane,
+                sysLen: r.systemLengths.reduce((a, b) => a + b, 0),
+                topKeys: r.topLevelKeyCount,
+                requestKeys: r.requestKeys,
+                bodyBytes: r.bodyBytes,
+                body: dry ? undefined : r.body,
+              });
+            }
+          }
+        }
+
+        const missing = [];
+        if (modes.includes('full') && PERCH_SYSTEM_PREFIX.length === 0) missing.push('.perch-prefix.txt');
+        if (modes.includes('full-agents') && PERCH_AGENTS_PREFIX.length === 0) missing.push('.perch-prompt-agents.txt');
+
+        if (dry || missing.length) {
+          json(res, 200, { dry: true, cells: cells.map(({ body: _b, ...c }) => c), missing, planned: cells.length });
+          return;
+        }
+
+        // Live path: same preflight the CLI probe uses. A banned account would make
+        // every cell return the same 403, so refuse before spending anything.
+        const loaded = await store.reload();
+        if (!loaded) { json(res, 409, { error: 'no session' }); return; }
+        // `pick()` throws when every slot is unusable. For the matrix that is not an
+        // error condition: "the account is banned" is exactly the finding, so report
+        // it as a normal dry-ish result with a stopReason instead of a 403 body.
+        let picked;
+        try {
+          picked = store.pick();
+        } catch (e) {
+          json(res, 200, {
+            dry: false, stopReason: e.code || 'no_session',
+            stopMessage: e.message, results: [], planned: cells.length, missing,
+          });
+          return;
+        }
+        const results = [];
+        let stopReason = null;
+        try {
+          const baseUrl = (picked.slot.session?.appUrl || config.appUrl).replace(/\/+$/, '');
+          let token = null;
+          try { token = await store.token(picked.slot); } catch (e) { stopReason = e.code || 'no_token'; }
+          if (token) {
+            const ban = await checkBan({ baseUrl, token });
+            if (ban.banned) { stopReason = 'banned'; store.markBanned(picked.slot, ban.blockedReason); }
+          }
+          if (!stopReason) {
+            const previous = { promptMode: config.promptMode, lane: config.lane, envelopeMode: config.envelopeMode };
+            try {
+              for (const [i, cell] of cells.slice(0, limit).entries()) {
+                if (i > 0) await new Promise((r) => setTimeout(r, gapMs));
+                const started = Date.now();
+                try {
+                  config.promptMode = cell.mode;
+                  config.lane = cell.lane;
+                  config.envelopeMode = cell.envelopeMode;
+                  const messages = normalizeMessages(
+                    [{ role: 'user', content: body?.prompt || 'Reply with exactly one word: PONG' }],
+                    { mode: cell.mode },
+                  );
+                  const runId = `matrix-${Date.now().toString(36)}-${i}`;
+                  const sent = buildRequestBody({
+                    messages, tools: null, toolChoice: null, maxTokens: 512, temperature: 0.2, stop: null,
+                    model: resolveModel('perch'), runId, reasoning: null,
+                    attribution: {
+                      userId: picked.slot.session?.userId ?? null,
+                      workspaceId: process.env.PERCH_WORKSPACE_ID || null,
+                      runId, lane: cell.lane, source: 'cli', billingMultiplier: null,
+                    },
+                    lane: cell.lane,
+                  });
+                  const upstream = await fetch(`${baseUrl}/api/perch-terminal/model-call`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Accept: 'text/event-stream',
+                      Authorization: `Bearer ${token}`,
+                      'User-Agent': config.userAgent,
+                      'x-perch-locale': config.locale,
+                      'x-perch-call-delta': '1',
+                    },
+                    body: JSON.stringify(sent),
+                    signal: AbortSignal.timeout(180_000),
+                  });
+                  const raw = await upstream.text();
+                  let payload = null;
+                  try { payload = JSON.parse(raw); } catch { /* SSE */ }
+                  const category = upstream.status === 403 ? classify403(payload) : null;
+                  results.push({
+                    id: cell.id, mode: cell.mode, envelopeMode: cell.envelopeMode, lane: cell.lane,
+                    sysLen: cell.sysLen, topKeys: cell.topKeys,
+                    status: upstream.status, category,
+                    errorCode: payload?.errorCode ?? null, error: payload?.error ?? null,
+                    ms: Date.now() - started,
+                  });
+                  emit(upstream.ok ? 'INFO' : 'WARN', {
+                    code: 'matrix_cell',
+                    message: `${cell.id} → HTTP ${upstream.status}${category ? ` (${category})` : ''}`,
+                    status: upstream.status, cell: cell.id,
+                  });
+                  if (category === 'banned') { stopReason = 'banned'; break; }
+                } catch (e) {
+                  results.push({
+                    id: cell.id, mode: cell.mode, envelopeMode: cell.envelopeMode, lane: cell.lane,
+                    sysLen: cell.sysLen, topKeys: cell.topKeys,
+                    status: 0, transportError: e.message, ms: Date.now() - started,
+                  });
+                }
+              }
+            } finally {
+              config.promptMode = previous.promptMode;
+              config.lane = previous.lane;
+              config.envelopeMode = previous.envelopeMode;
+            }
+          }
+        } finally {
+          picked.release();
+        }
+        json(res, 200, { dry: false, stopReason, results, planned: cells.length, missing });
         return;
       }
 

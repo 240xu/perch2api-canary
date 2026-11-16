@@ -85,6 +85,46 @@ Today is ${human} (${iso}). Use this for date calculations when scheduling or re
 </perch_turn_context>`;
 })();
 
+/**
+ * The operator prompt is generated, not shipped: 91.7% static template, the rest
+ * filled in at runtime. Two lines are machine- or day-specific, and a capture taken
+ * on another machine on another day carries stale values for them.
+ *
+ * Measured against `perchai-cli@2.4.134`:
+ *   - ask   carries `Workspace root: <cwd>` only; the date lives in turn_context.
+ *   - agents carries both.
+ *
+ * Shipping a frozen `Workspace root: /home/ova` and `Today is Tuesday, October 13,
+ * 2026` is worse than shipping no prompt at all: it is a timestamped claim that the
+ * request was replayed from an old capture. Rewriting them at send time keeps the
+ * body honest without touching the 27,615 characters that did not change.
+ */
+const WORKSPACE_ROOT_RE = /^Workspace root: .*?(?=\. Treat relative paths)/m;
+const TODAY_IS_RE = /^Today is [^\n]*$/m;
+
+/** Fresh `Today is …` line, computed per call rather than per process. */
+export function todayLine() {
+  const d = new Date();
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const human = `${days[d.getUTCDay()]}, ${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
+  const iso = d.toISOString().slice(0, 10);
+  return `Today is ${human} (${iso}). Use this for date calculations when scheduling or referencing time.`;
+}
+
+/**
+ * Rewrite the runtime-generated lines of a captured prompt so they describe *this*
+ * machine on *this* day. Everything else is left byte-identical.
+ */
+export function freshenPrompt(text) {
+  if (!text) return text;
+  let out = text;
+  const root = config.workspaceRoot;
+  if (root) out = out.replace(WORKSPACE_ROOT_RE, `Workspace root: ${root}`);
+  out = out.replace(TODAY_IS_RE, todayLine());
+  return out;
+}
+
 const NL = String.fromCharCode(10, 10);
 
 /**
@@ -158,9 +198,9 @@ export function composeSystem(callerText, mode = config.promptMode) {
   }
 
   const injected = mode === 'full'
-    ? PERCH_SYSTEM_PREFIX
+    ? freshenPrompt(PERCH_SYSTEM_PREFIX)
     : mode === 'full-agents'
-      ? PERCH_AGENTS_PREFIX
+      ? freshenPrompt(PERCH_AGENTS_PREFIX)
       : CANARY;
 
   if (mode === 'canary-merge' || mode === 'canary-scrub') {

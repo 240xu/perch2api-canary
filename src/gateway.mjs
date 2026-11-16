@@ -76,39 +76,49 @@ export function buildRequestBody({
   // The capture has no `stop`, so it is only forwarded in the dialect that also
   // reintroduces the other extras. Callers that need it can use magpie mode.
   if (magpie && Array.isArray(stop) && stop.length) request.stop = stop;
-  if (reasoning) request.reasoning = reasoning;
-  if (magpie && model.kind === 'pin') request.preferredModelId = model.preferredModelId;
+  // `request.reasoning` and `request.preferredModelId` were measured absent in 14/14
+  // captures of 2.4.108 through 2.4.134. Sending either is a tell, so neither is
+  // emitted here even when a caller asks for reasoning; reasoning travels as the
+  // top-level `roostReasoning` / `effort` pair instead.
 
   const body = {
     request,
     runId,
     lane: lane || config.lane,
     strictManual: false,
-    preferredModelId: model.kind === 'pin' ? model.preferredModelId : null,
+    // Always present. Measured null in every capture, including when a model is
+    // pinned — the pin travels in `manualModelOptionId`, never here.
+    preferredModelId: null,
     avoidModelIds: [],
     attribution,
     clientSurface: config.clientSurface,
   };
 
-  if (model.kind === 'roost') {
-    // The capture cannot settle this one: it always carried a pin, so there is no
-    // roost sample to copy. The default tier is what the server resolves to on its
-    // own, so asking for it explicitly would only add a ninth top-level key for no
-    // reason — it is sent only when a non-default tier is requested.
-    if (model.roostModelChoice !== 'standard' || magpie) {
-      body.roostModelChoice = model.roostModelChoice;
-    }
-    if (magpie || config.sendRoostExtras) {
-      body.roostReasoning = true;
-      body.effort = { level: 'high', orchestration: false };
-    }
+  // Present since 2.4.114. `magpie` emits it unconditionally because every modern
+  // capture carries it; `honeypot` deliberately omits it to reproduce the 2.4.108
+  // shape byte for byte, which is the only reason that dialect still exists.
+  // Assigned before the effort block so key order matches the wire: `resendAfterOutput`
+  // precedes `roostModelChoice` / `roostReasoning` / `effort` in every capture.
+  if (magpie) body.resendAfterOutput = true;
+
+  // Measured: `effort` / `roostModelChoice` / `roostReasoning` appear together or not
+  // at all, and the only trigger is whether the CLI was invoked with `--effort`.
+  // roostReasoning is derived server-side as `effort.level !== 'off'`. The official
+  // default (no flag) sends none of the three, so we do the same unless asked.
+  if (config.sendRoostExtras) {
+    const level = config.effortLevel;
+    body.roostModelChoice = model.roostModelChoice || 'standard';
+    body.roostReasoning = level !== 'off';
+    body.effort = { level, orchestration: false };
   }
 
-  if (model.kind === 'pin' && (magpie || config.sendManualOption)) {
+  // Measured: sent whenever a model is pinned, unconditionally — not only in one
+  // envelope dialect. `preferredModelId` stays null in that case. Gated on `magpie`
+  // because 2.4.108 predates the key; the honeypot dialect must stay 8 keys.
+  if (model.kind === 'pin' && magpie) {
     body.manualModelOptionId = model.preferredModelId;
   }
 
-  if (magpie) body.resendAfterOutput = true;
 
   // Cheap regression guard: a lane inside `request` makes Perch treat the call
   // as coming from somewhere other than its own CLI and answer

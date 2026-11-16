@@ -18,7 +18,7 @@ import http from 'node:http';
 
 import {
   PERCH_SYSTEM_PREFIX, PERCH_AGENTS_PREFIX, HAS_SYSTEM_PREFIX, SYSTEM_PREFIX_SOURCE, AGENTS_PREFIX_SOURCE,
-  promptForMode, describeMode, modeNeedsFullPrompt, CANARY,
+  promptForMode, describeMode, modeNeedsFullPrompt, CANARY, PROMPT_MODES,
 } from './perch-prefix.mjs';
 import { config, loadRuntime } from './config.mjs';
 import { SessionStore } from './session.mjs';
@@ -475,6 +475,7 @@ export async function gatewayState() {
     prompt: {
       mode: config.promptMode,
       description: describeMode(config.promptMode),
+      modes: PROMPT_MODES,
       canaryChars: CANARY.length,
       fullChars: PERCH_SYSTEM_PREFIX.length,
       agentsChars: PERCH_AGENTS_PREFIX.length,

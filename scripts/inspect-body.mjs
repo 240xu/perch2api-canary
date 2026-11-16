@@ -27,12 +27,35 @@ function flag(name) {
   return args.includes(`--${name}`);
 }
 
-/** The eight keys of the captured official body, in capture order. */
+/**
+ * Reference shapes, in wire order.
+ *
+ * There is no single "official body" any more. Measured against `perchai-cli`:
+ *   2.4.108         8 keys (honeypot dialect)
+ *   2.4.114+        9 keys — adds resendAfterOutput
+ *   with --effort  12 keys — adds roostModelChoice, roostReasoning, effort
+ *   with a pin     13 keys — adds manualModelOptionId
+ * A pin does NOT populate preferredModelId; it stays null.
+ */
 const OFFICIAL_TOP_KEYS = [
   'request', 'runId', 'lane', 'strictManual', 'preferredModelId',
   'avoidModelIds', 'attribution', 'clientSurface',
 ];
-const OFFICIAL_REQUEST_KEYS = ['messages', 'tools', 'temperature', 'maxTokens', 'toolChoice'];
+const OFFICIAL_TOP_KEYS_MODERN = [...OFFICIAL_TOP_KEYS, 'resendAfterOutput'];
+const OFFICIAL_TOP_KEYS_EFFORT = [...OFFICIAL_TOP_KEYS_MODERN, 'roostModelChoice', 'roostReasoning', 'effort'];
+const OFFICIAL_TOP_KEYS_PIN = [...OFFICIAL_TOP_KEYS_EFFORT, 'manualModelOptionId'];
+/** ask sends no tools; agents adds tools + toolChoice. */
+const OFFICIAL_REQUEST_KEYS = ['messages', 'temperature', 'maxTokens'];
+const OFFICIAL_REQUEST_KEYS_AGENTS = ['messages', 'tools', 'temperature', 'maxTokens', 'toolChoice'];
+
+/** The reference shape the current config should reproduce. */
+function referenceTopKeys() {
+  if (envelopeMode === 'honeypot') return OFFICIAL_TOP_KEYS;
+  if (config.sendRoostExtras) {
+    return model.kind === 'pin' ? OFFICIAL_TOP_KEYS_PIN : OFFICIAL_TOP_KEYS_EFFORT;
+  }
+  return model.kind === 'pin' ? [...OFFICIAL_TOP_KEYS_MODERN, 'manualModelOptionId'] : OFFICIAL_TOP_KEYS_MODERN;
+}
 
 const mode = arg('mode', config.promptMode);
 const lane = arg('lane', config.lane);
@@ -67,13 +90,17 @@ function diffKeys(actual, expected) {
 }
 
 function report(result) {
-  const top = diffKeys(result.topLevelKeys, OFFICIAL_TOP_KEYS);
-  const req = diffKeys(result.requestKeys, OFFICIAL_REQUEST_KEYS);
+  const refTop = referenceTopKeys();
+  const refReq = result.requestKeys.includes('tools') || result.requestKeys.includes('toolChoice')
+    ? OFFICIAL_REQUEST_KEYS_AGENTS
+    : OFFICIAL_REQUEST_KEYS;
+  const top = diffKeys(result.topLevelKeys, refTop);
+  const req = diffKeys(result.requestKeys, refReq);
   const okTop = !top.extra.length && !top.missing.length;
-  // `request` is allowed to carry FEWER keys than the capture: the captured call
-  // shipped 57 tools, a caller without tools legitimately has no tools/toolChoice.
-  // Extra keys are never acceptable.
-  const okReq = req.extra.length === 0;
+  // `request` is allowed to carry FEWER keys than the reference: a caller without
+  // tools legitimately has no tools/toolChoice. Extra keys are never acceptable,
+  // and so is `lane`, which the official body has never carried there.
+  const okReq = req.extra.length === 0 && req.missing.length === 0;
   const okLane = result.laneInsideRequest === false;
   const okDelta = result.headers['x-perch-call-delta'] === '1';
 
@@ -87,9 +114,9 @@ function report(result) {
   lines.push(`lane inside req   = ${result.laneInsideRequest ? 'PRESENT (must be absent)' : 'absent'}`);
   lines.push('');
   lines.push(`top-level keys    = ${result.topLevelKeyCount}  [${result.topLevelKeys.join(', ')}]`);
-  lines.push(`  vs official (8) = ${okTop ? 'identical' : `extra=[${top.extra.join(',')}] missing=[${top.missing.join(',')}]`}`);
+  lines.push(`  vs reference(${refTop.length}) = ${okTop ? 'identical' : `extra=[${top.extra.join(',')}] missing=[${top.missing.join(',')}]`}`);
   lines.push(`request keys      = [${result.requestKeys.join(', ')}]`);
-  lines.push(`  vs official     = ${okReq ? 'identical' : `extra=[${req.extra.join(',')}] missing=[${req.missing.join(',')}]`}`);
+  lines.push(`  vs reference     = ${okReq ? 'identical' : `extra=[${req.extra.join(',')}] missing=[${req.missing.join(',')}]`}`);
   lines.push('');
   lines.push(`preferredModelId  = ${JSON.stringify(result.preferredModelId)}`);
   if (result.manualModelOptionId !== null) lines.push(`manualModelOptionId = ${result.manualModelOptionId}`);
@@ -106,14 +133,14 @@ function report(result) {
   lines.push(`bodyBytes         = ${result.bodyBytes}`);
   lines.push(`envelopeMode      = ${envelopeMode}`);
   lines.push('');
-  lines.push(`VERDICT           = ${okTop && okReq && okLane && okDelta ? 'matches the captured official shape' : 'DEVIATES — see the lines marked above'}`);
+  lines.push(`VERDICT           = ${okTop && okReq && okLane && okDelta ? 'matches the reference shape for this config' : 'DEVIATES — see the lines marked above'}`);
   return lines.join('\n');
 }
 
 if (flag('all')) {
   const rows = PROMPT_MODES.map((m) => {
     const r = run({ mode: m });
-    const top = diffKeys(r.topLevelKeys, OFFICIAL_TOP_KEYS);
+    const top = diffKeys(r.topLevelKeys, referenceTopKeys());
     const req = diffKeys(r.requestKeys, OFFICIAL_REQUEST_KEYS);
     return {
       mode: m,
@@ -123,7 +150,7 @@ if (flag('all')) {
       roles: r.roles.join(','),
       topKeys: r.topLevelKeyCount,
       topOk: !top.extra.length && !top.missing.length,
-      reqOk: req.extra.length === 0,
+      reqOk: req.extra.length === 0 && req.missing.length === 0,
       laneInReq: r.laneInsideRequest,
       delta: r.headers['x-perch-call-delta'] === '1',
     };
@@ -131,7 +158,8 @@ if (flag('all')) {
   if (flag('json')) {
     console.log(JSON.stringify({ officialTopKeys: OFFICIAL_TOP_KEYS, officialRequestKeys: OFFICIAL_REQUEST_KEYS, rows }, null, 2));
   } else {
-    console.log('mode           injected  systems  sysLen        roles                     topKeys  top=8  req=5  laneInReq  x-call-delta');
+    console.log(`reference shape: ${referenceTopKeys().length} top-level keys, envelope=${envelopeMode}`);
+    console.log('mode           injected  systems  sysLen        roles                     topKeys  shape  req  laneInReq  x-call-delta');
     for (const row of rows) {
       console.log(
         `${row.mode.padEnd(14)} ${String(row.chars).padStart(7)}  ${String(row.systems).padStart(7)}  ${row.sysLen.padEnd(13)} ${row.roles.padEnd(25)} ${String(row.topKeys).padStart(7)}  ${row.topOk ? 'yes  ' : 'NO   '}  ${row.reqOk ? 'yes  ' : 'NO   '}  ${row.laneInReq ? 'YES       ' : 'no        '}  ${row.delta ? 'yes' : 'NO'}`,

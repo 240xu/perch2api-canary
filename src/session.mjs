@@ -36,6 +36,22 @@ const LOCK_POLL_MS = 50;
 const REFRESH_FAIL_BACKOFF_MS = 30_000;
 const REVOKED_TTL_MS = 24 * 60 * 60 * 1000;
 const ACCOUNT_TTL_MS = 30_000;
+/**
+ * Retry budget for the token endpoint.
+ *
+ * MEASURED (2026-11-16, wuming): the Supabase auth host completes a TLS handshake
+ * and presents a valid certificate, but ~85% of HTTPS requests to it are reset
+ * before a response arrives — 3/20 succeeded, while app.perchai.app, GitHub and npm
+ * were 8/8 from the same box. Both Cloudflare anycast IPs behind it behaved the same,
+ * so it is the path, not the endpoint.
+ *
+ * A single attempt therefore fails four times out of five, which looked like a
+ * revoked session and was not one. Six attempts at ~1 s spacing makes the expected
+ * failure rate 0.85^6 ≈ 0.4% without any longer backoff that would fight the
+ * upstream's own rate limits.
+ */
+const REFRESH_ATTEMPTS = 6;
+const REFRESH_RETRY_MS = 900;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -224,15 +240,50 @@ export class SessionStore {
     if (!session?.refreshToken) return;
     const base = session.appUrl || config.appUrl;
 
-    const cfgRes = await fetch(`${base}/api/perch-terminal/cli-auth/config`, {
+    // A transport failure here is not the same as a rejected token, and it must not
+    // escape as a bare `fetch failed`: callers branch on `code`.
+    const netFail = (stage, error) => Object.assign(
+      new Error(`token refresh network failure at ${stage}: ${error?.cause?.code || error?.message || error} after ${REFRESH_ATTEMPTS} attempt(s)`),
+      { code: 'refresh_network', status: 503, cause: error },
+    );
+
+    /**
+     * Retry only connection-level failures. An HTTP status is an answer and is
+     * handled by the caller; a reset is not an answer.
+     *
+     * The abort signal is created per attempt: `AbortSignal.timeout()` starts ticking
+     * when constructed, so sharing one instance across retries makes every attempt
+     * after the first abort immediately.
+     */
+    const fetchWithRetry = async (url, { timeoutMs, ...init }, stage) => {
+      let lastError = null;
+      for (let attempt = 1; attempt <= REFRESH_ATTEMPTS; attempt += 1) {
+        try {
+          return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+        } catch (error) {
+          lastError = error;
+          if (attempt < REFRESH_ATTEMPTS) await sleep(REFRESH_RETRY_MS);
+        }
+      }
+      slot.refreshFailAt = Date.now();
+      emit('WARN', {
+        code: 'refresh_network',
+        message: `${stage} unreachable after ${REFRESH_ATTEMPTS} attempts: ${lastError?.cause?.code || lastError?.message}`,
+        file: slot.file,
+      });
+      throw netFail(stage, lastError);
+    };
+
+    const cfgRes = await fetchWithRetry(`${base}/api/perch-terminal/cli-auth/config`, {
+      timeoutMs: 15_000,
       headers: { Accept: 'application/json', 'User-Agent': config.userAgent },
-      signal: AbortSignal.timeout(15_000),
-    });
+    }, 'cli-auth/config');
     if (!cfgRes.ok) throw new Error(`cli-auth/config HTTP ${cfgRes.status}`);
     const cfg = await cfgRes.json();
     if (!cfg?.supabaseUrl || !cfg?.supabaseAnonKey) throw new Error('cli-auth/config missing supabase credentials');
 
-    const res = await fetch(`${cfg.supabaseUrl}/auth/v1/token?grant_type=refresh_token`, {
+    const res = await fetchWithRetry(`${cfg.supabaseUrl}/auth/v1/token?grant_type=refresh_token`, {
+      timeoutMs: 20_000,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -240,8 +291,7 @@ export class SessionStore {
         Authorization: `Bearer ${cfg.supabaseAnonKey}`,
       },
       body: JSON.stringify({ refresh_token: session.refreshToken }),
-      signal: AbortSignal.timeout(20_000),
-    });
+    }, 'supabase /token');
     const body = await res.json().catch(() => null);
     if (!res.ok || !body?.access_token) {
       const message = `token refresh failed: HTTP ${res.status} ${body?.error_description || body?.error || ''}`.trim();

@@ -90,22 +90,36 @@ export const config = {
   /** Append the per-turn context block to the first user message. */
   turnContext: bool(process.env.PERCH_TURN_CONTEXT, true),
 
+  /**
+   * Value substituted into the operator prompt's `Workspace root:` line when a
+   * `full` mode is active. Defaults to the gateway's own cwd, which is what the
+   * official client would report for itself. Empty leaves the captured line alone.
+   */
+  workspaceRoot: (process.env.PERCH_WORKSPACE_ROOT || process.cwd()).trim(),
+
   /** Scrub third-party agent self-names out of caller system text. */
   scrubIdentity: bool(process.env.PERCH_SCRUB_IDENTITY, true),
 
   /**
    * Envelope dialect.
-   *   honeypot — exactly the 8 top-level keys of the captured official call
-   *   magpie   — adds resendAfterOutput / roostReasoning / effort /
-   *              manualModelOptionId / request.preferredModelId (2.4.132 shape)
-   * The captured call is the authority, so `honeypot` is the default and the
-   * panel can flip this without a restart.
+   *   honeypot — the 8 top-level keys of the 2.4.108 capture (2026-10-13)
+   *   magpie   — the 9–13 key shape of 2.4.130/2.4.134: resendAfterOutput always,
+   *              manualModelOptionId on a pin, effort/roost only on request
+   * `magpie` is the default because 2.4.108 is 26 versions behind the client that
+   * actually exists. The panel can flip this without a restart, and the honeypot
+   * dialect is kept so A/B against the old capture stays possible.
    */
-  envelopeMode: enumv(process.env.PERCH_ENVELOPE_MODE, ['honeypot', 'magpie'], 'honeypot'),
-  /** Send manualModelOptionId alongside preferredModelId on pins. */
-  sendManualOption: bool(process.env.PERCH_SEND_MANUAL_OPTION, false),
-  /** Send the roost reasoning/effort triples. */
+  envelopeMode: enumv(process.env.PERCH_ENVELOPE_MODE, ['honeypot', 'magpie'], 'magpie'),
+  /** Legacy switch, superseded by magpie: manualModelOptionId is unconditional. */
+  sendManualOption: bool(process.env.PERCH_SEND_MANUAL_OPTION, true),
+  /**
+   * Send effort / roostModelChoice / roostReasoning. Measured: the official client
+   * emits all three only when invoked with `--effort`, and none by default. So this
+   * defaults to false — sending them when the CLI would not is itself a tell.
+   */
   sendRoostExtras: bool(process.env.PERCH_SEND_ROOST_EXTRAS, false),
+  /** off | low | medium | high — only meaningful when sendRoostExtras is on. */
+  effortLevel: enumv(process.env.PERCH_EFFORT_LEVEL, ['off', 'low', 'medium', 'high'], 'off'),
 
   /** off | best-effort | required — tickets are not required by the surface. */
   ticketMode: enumv(process.env.PERCH_TICKET_MODE, ['off', 'best-effort', 'required'], 'off'),
@@ -176,6 +190,7 @@ export const RUNTIME_FIELDS = {
   breakerThreshold: { type: 'int', min: 1, max: 50 },
   sendManualOption: { type: 'bool' },
   sendRoostExtras: { type: 'bool' },
+  effortLevel: { type: 'enum', values: ['off', 'low', 'medium', 'high'] },
   scrubIdentity: { type: 'bool' },
   turnContext: { type: 'bool' },
   paused: { type: 'bool' },
