@@ -174,3 +174,41 @@ sudo systemctl start perch2api
    That structural difference is permanent and is shown in the red-line tab.
 4. A banned account is not recoverable by any of these guards. The guards exist to
    stop a dead account from looking like a flaky one.
+
+## 9. Verifying without an account
+
+`scripts/e2e-replay.mjs` runs the gateway against `scripts/replay-upstream.mjs`, a
+scripted stand-in for `app.perchai.app`. It switches `PERCH_APP_URL` (and the
+`supabaseUrl` the stand-in advertises, so token refresh stays local too), boots a
+throwaway profile under a private `$HOME`, and walks the entire request path:
+
+```
+session -> token refresh -> turn ticket -> wire body -> SSE parse
+        -> OpenAI translation -> eventbus -> panel
+```
+
+Nothing leaves the machine, so it runs on a banned account, in CI, or offline. It
+also asserts the *recorded* request rather than a locally built one: nine top-level
+keys, three `request` keys when the caller sent no tools (four with tools), a
+275-character gate paragraph, `preferredModelId: null` and a boolean
+`resendAfterOutput`.
+
+Failure classes are covered too, because those are where a gateway quietly lies:
+a stream that ends without `done` must be `incomplete_stream`, `done.ok=false` must
+be `model_call_failed`, a 503 must be retried and a 429 must not, a
+`perch_surface_required` 403 must leave the account usable while `banned` must
+retire it without spending another call.
+
+```bash
+node scripts/e2e-replay.mjs                # everything, exits non-zero on any failure
+node scripts/e2e-replay.mjs --only stream  # one group
+node scripts/e2e-replay.mjs --keep         # keep the temp profile for inspection
+```
+
+One case is worth calling out. When upstream sends `stream_restart` after content
+has already been delivered, the bytes cannot be retracted. If the terminal
+`done.text` does not begin with what was already sent, the stream now ends with an
+explicit `stream_restart_conflict` error frame instead of a `finish_reason: stop`
+over corrupted text. The observed upstream shape (`mid_tool_call_failover`, text
+unchanged) is *not* an error and passes through untouched — abandoning a tool call
+does not invalidate the prose.

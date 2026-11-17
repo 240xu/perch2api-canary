@@ -309,7 +309,9 @@ const PAGE = `<!doctype html>
       <div class="kv"><span>多认证方式探测</span><span class="dim">只用 Bearer</span></div>
       <div class="kv"><span>伪造 cli-turn / cli-learning</span><span class="dim">默认不发；面板长期显示该偏离</span></div>
       <div class="kv"><span>批量注册 / 指纹伪装 / 代理轮换</span><span class="dim">不做</span></div>
-      <div class="kv"><span>单次探针间隔</span><span class="dim">≥30s，失败不重试</span></div>
+      <div class="kv"><span>单次探针间隔</span><span class="dim">≥30s</span></div>
+      <div class="kv"><span>模型调用重试</span><span class="dim">仅 5xx / 408 / 425 / 超时，最多 2 次；403 / 429 一次即终</span></div>
+      <div class="kv"><span>token 刷新重试</span><span class="dim">6 次 × 900ms（到 Supabase 的链路约 85% 被重置，实测 3/20）</span></div>
       <div class="kv"><span>公网暴露</span><span class="dim">面板只听 127.0.0.1:8802</span></div>
     </div>
   </section>

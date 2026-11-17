@@ -78,8 +78,16 @@ node scripts/login.mjs --out accounts/acc2.json   # extra account for rotation
 Verify:
 
 ```bash
-node scripts/smoke.mjs
+node scripts/e2e-replay.mjs   # full request path, no account, no network
+node scripts/smoke.mjs        # same surfaces against a live account
 ```
+
+`e2e-replay.mjs` boots the gateway against a scripted local upstream
+(`replay-upstream.mjs`) and walks the whole path — session → token refresh →
+turn ticket → body → SSE parse → OpenAI translation → eventbus — asserting both
+the wire body shape and every failure classification. It needs no account and
+makes no outbound connection, so it works even when the account is banned.
+`smoke.mjs` is the live gate; it needs a session that Perch will actually serve.
 
 ## API
 
@@ -224,6 +232,9 @@ perch2api/
 ├── scripts/
 │   ├── login.mjs           PKCE login, writes cli-auth-session.json
 │   ├── extract-prefix.mjs  derives the gate prefix from your Perch install
+│   ├── replay-upstream.mjs scripted stand-in for app.perchai.app (records bodies)
+│   ├── e2e-replay.mjs      full-path checks against that stand-in, no account needed
+│   ├── probe-matrix.mjs    sweeps prompt × envelope × lane against a live account
 │   └── smoke.mjs           end-to-end checks against a running instance
 ├── docs/RE-FINDINGS.md     reverse-engineering report (observed/inferred/unknown)
 └── re/                     the artifacts the findings came from
@@ -231,5 +242,12 @@ perch2api/
 
 ## Status
 
-Working end to end against a live account (2026-10-26): non-streaming, streaming,
-tool calls, plan-refusal passthrough, token refresh. `scripts/smoke.mjs` is the gate.
+The request path is verified end to end without an account: `scripts/e2e-replay.mjs`
+drives session → token refresh → turn ticket → wire body → SSE parse → OpenAI
+translation → eventbus against a scripted upstream, and checks that the body it
+sends has the same nine top-level keys, three `request` keys and 275-character
+gate paragraph the official 2.4.134 client was captured sending.
+
+What that cannot prove is that Perch answers 200. That needs an account Perch is
+willing to serve, and the one on this deployment is banned. The last live run of
+`scripts/smoke.mjs` that passed was 2026-10-26; it has not been repeatable since.

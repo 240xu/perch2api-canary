@@ -363,7 +363,10 @@ export function toOpenAIUsage(usage) {
  * Writes to `res` directly; returns the terminal Perch `done` frame.
  */
 export async function pipeAsOpenAIStream({ res, id, created, modelName, call, includeUsage = false }) {
-  const state = { sentAny: false, toolCalls: [], textLength: 0 };
+  // `delivered` is what the client has already been shown. A `stream_restart`
+  // cannot take bytes back off the wire, so this is kept solely to compare
+  // against the final `done.text` at the end of the turn.
+  const state = { sentAny: false, toolCalls: [], textLength: 0, delivered: '' };
 
   const write = (payload) => {
     if (res.writableEnded) return;
@@ -401,6 +404,7 @@ export async function pipeAsOpenAIStream({ res, id, created, modelName, call, in
           if (typeof event.text === 'string' && event.text.length) {
             state.sentAny = true;
             state.textLength += event.text.length;
+            state.delivered += event.text;
             write(chunk({ content: event.text }));
           }
           break;
@@ -416,6 +420,10 @@ export async function pipeAsOpenAIStream({ res, id, created, modelName, call, in
           break;
         }
         case 'stream_restart':
+          // Observed upstream as `{"type":"stream_restart","reason":"mid_tool_call_failover"}`
+          // right after a tool-call fragment: the tool decision is abandoned, the
+          // text already sent is not. Reset the accumulators, but keep `delivered`
+          // so the terminal frame can be checked against what the client saw.
           state.textLength = 0;
           state.toolCalls = [];
           break;
@@ -428,6 +436,27 @@ export async function pipeAsOpenAIStream({ res, id, created, modelName, call, in
     },
   });
   clearInterval(beat);
+
+  // The one thing streaming cannot do is retract. If upstream restarted and the
+  // final text does not begin with what was already rendered, the caller has been
+  // shown a wrong prefix; saying `finish_reason: stop` would report that as a
+  // successful answer. Surface it instead — the status line is long gone, but an
+  // explicit error frame is better than silent corruption.
+  if (state.delivered && typeof done.text === 'string' && done.text.length
+      && !done.text.startsWith(state.delivered)) {
+    write({
+      error: {
+        message: 'Upstream restarted mid-stream and the final answer contradicts the text already delivered; the streamed prefix is not trustworthy.',
+        type: 'upstream_error',
+        code: 'stream_restart_conflict',
+      },
+    });
+    if (!res.writableEnded) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+    return done;
+  }
 
   const toolCalls = state.toolCalls.length ? state.toolCalls : normalizeToolCalls(done.toolCalls);
   if (toolCalls.length) {
