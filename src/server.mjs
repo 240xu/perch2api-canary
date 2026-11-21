@@ -22,6 +22,7 @@ import {
 } from './perch-prefix.mjs';
 import { config, loadRuntime } from './config.mjs';
 import { SessionStore } from './session.mjs';
+import { requestTurnTicket } from './ticket.mjs';
 import { buildRequestBody, callModel, fetchAccount, PerchError } from './gateway.mjs';
 import { resolveModel, listModels } from './models.mjs';
 import {
@@ -173,10 +174,28 @@ function attributionFor(slot, runId, lane) {
  * accounts die young. So the default is `off`, `best-effort` degrades on failure
  * and only `required` makes a missing ticket fatal.
  */
+/**
+ * Ticket per slot, cached for its TTL.
+ *
+ * The fetch itself lives in `ticket.mjs` so the probes send the same request this
+ * gateway does. Everything here is only the caching and the mode policy.
+ */
 async function maybeTicket(slot, token) {
   if (config.ticketMode === 'off') return null;
+  const now = Date.now();
+  if (slot.ticket && slot.ticket.expiresAt > now + 30_000) return slot.ticket;
   try {
-    return await fetchTurnTicket(slot, token);
+    const ticket = await requestTurnTicket({
+      baseUrl: slot.session?.appUrl || config.appUrl,
+      token,
+      userAgent: config.userAgent,
+      locale: config.locale,
+    });
+    slot.ticket = ticket;
+    if (process.env.PERCH_DEBUG_WIRE === '1') {
+      console.log('[ticket]', slot.session?.appUrl || config.appUrl, 'run=', ticket.runId, 'id=', ticket.ticketId);
+    }
+    return ticket;
   } catch (error) {
     if (config.ticketMode === 'required') throw error;
     emit('WARN', {
@@ -186,41 +205,6 @@ async function maybeTicket(slot, token) {
     });
     return null;
   }
-}
-
-async function fetchTurnTicket(slot, token) {
-  const now = Date.now();
-  if (slot.ticket && slot.ticket.expiresAt > now + 30_000) return slot.ticket;
-  const appUrl = (slot.session?.appUrl || config.appUrl).replace(/\/+$/, '');
-  const res = await fetch(`${appUrl}/api/perch-terminal/turn-ticket`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      Authorization: `Bearer ${token}`,
-      'User-Agent': config.userAgent,
-      'x-perch-locale': config.locale,
-    },
-    body: JSON.stringify({ surface: 'cli', profile: 'standard', ticketClient: 2 }),
-  });
-  const data = await res.json().catch(() => null);
-  if (process.env.PERCH_DEBUG_WIRE === '1') {
-    console.log('[ticket]', appUrl, 'status=', res.status, 'ok=', data?.ok, 'run=', data?.runId ?? 'none', 'enforced=', data?.enforced, 'err=', data?.error ?? 'none');
-  }
-  if (!res.ok || !data?.ticket || !data?.ticketId || !data?.runId) {
-    throw Object.assign(new Error(data?.error || `turn ticket HTTP ${res.status}`), {
-      status: res.status,
-      code: data?.errorCode || 'turn_ticket_unavailable',
-    });
-  }
-  const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 300_000;
-  slot.ticket = {
-    token: data.ticket,
-    ticketId: data.ticketId,
-    runId: data.runId,
-    expiresAt: Number.isFinite(expiresAt) ? expiresAt : now + 300_000,
-  };
-  return slot.ticket;
 }
 
 function statusForPerchError(error) {

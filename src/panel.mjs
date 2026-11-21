@@ -23,8 +23,9 @@ import { buildRequestBody } from './gateway.mjs';
 import { normalizeMessages, scrubIdentity } from './openai.mjs';
 import { resolveModel } from './models.mjs';
 import { emit, sinceRequests, sinceEvents, subscribe, stats, today } from './eventbus.mjs';
-import { checkBan, classify403, checkCliVersion, latestPublishedVersion } from './guard.mjs';
+import { checkBan, checkCliVersion, latestPublishedVersion } from './guard.mjs';
 import { SessionStore } from './session.mjs';
+import { sendModelCallOnce } from './probe.mjs';
 
 const PROBE_MIN_GAP_MS = 30_000;
 let lastProbeAt = 0;
@@ -799,61 +800,39 @@ export async function startPanel({ state, store, guardState, config: cfg }) {
             try {
               for (const [i, cell] of cells.slice(0, limit).entries()) {
                 if (i > 0) await new Promise((r) => setTimeout(r, gapMs));
-                const started = Date.now();
                 try {
                   config.promptMode = cell.mode;
                   config.lane = cell.lane;
-                  config.envelopeMode = cell.envelopeMode;
-                  const messages = normalizeMessages(
-                    [{ role: 'user', content: body?.prompt || 'Reply with exactly one word: PONG' }],
-                    { mode: cell.mode },
-                  );
-                  const runId = `matrix-${Date.now().toString(36)}-${i}`;
-                  const sent = buildRequestBody({
-                    messages, tools: null, toolChoice: null, maxTokens: 512, temperature: 0.2, stop: null,
-                    model: resolveModel('perch'), runId, reasoning: null,
-                    attribution: {
-                      userId: picked.slot.session?.userId ?? null,
-                      workspaceId: process.env.PERCH_WORKSPACE_ID || null,
-                      runId, lane: cell.lane, source: 'cli', billingMultiplier: null,
-                    },
+                  const got = await sendModelCallOnce({
+                    baseUrl, token,
+                    prompt: body?.prompt || 'Reply with exactly one word: PONG',
+                    mode: cell.mode,
                     lane: cell.lane,
+                    envelopeMode: cell.envelopeMode,
+                    userId: picked.slot.session?.userId ?? null,
                   });
-                  const upstream = await fetch(`${baseUrl}/api/perch-terminal/model-call`, {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      Accept: 'text/event-stream',
-                      Authorization: `Bearer ${token}`,
-                      'User-Agent': config.userAgent,
-                      'x-perch-locale': config.locale,
-                      'x-perch-call-delta': '1',
-                    },
-                    body: JSON.stringify(sent),
-                    signal: AbortSignal.timeout(180_000),
-                  });
-                  const raw = await upstream.text();
-                  let payload = null;
-                  try { payload = JSON.parse(raw); } catch { /* SSE */ }
-                  const category = upstream.status === 403 ? classify403(payload) : null;
+                  const upstream = { status: got.status, ok: got.status >= 200 && got.status < 300 };
                   results.push({
                     id: cell.id, mode: cell.mode, envelopeMode: cell.envelopeMode, lane: cell.lane,
                     sysLen: cell.sysLen, topKeys: cell.topKeys,
-                    status: upstream.status, category,
-                    errorCode: payload?.errorCode ?? null, error: payload?.error ?? null,
-                    ms: Date.now() - started,
+                    status: got.status, category: got.category,
+                    errorCode: got.errorCode, error: got.error,
+                    ticket: got.ticket,
+                    firstDelta: got.firstDelta,
+                    ms: got.ms,
                   });
                   emit(upstream.ok ? 'INFO' : 'WARN', {
                     code: 'matrix_cell',
-                    message: `${cell.id} → HTTP ${upstream.status}${category ? ` (${category})` : ''}`,
-                    status: upstream.status, cell: cell.id,
+                    message: `${cell.id} → HTTP ${got.status}${got.category ? ` (${got.category})` : ''}`
+                      + (got.ticket ? ` ticket=${got.ticket.id}` : ' ticket=none'),
+                    status: got.status, cell: cell.id,
                   });
-                  if (category === 'banned') { stopReason = 'banned'; break; }
+                  if (got.category === 'banned') { stopReason = 'banned'; break; }
                 } catch (e) {
                   results.push({
                     id: cell.id, mode: cell.mode, envelopeMode: cell.envelopeMode, lane: cell.lane,
                     sysLen: cell.sysLen, topKeys: cell.topKeys,
-                    status: 0, transportError: e.message, ms: Date.now() - started,
+                    status: 0, transportError: e.message, ms: null,
                   });
                 }
               }

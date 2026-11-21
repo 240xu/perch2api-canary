@@ -20,10 +20,8 @@ import path from 'node:path';
 
 import { config } from '../src/config.mjs';
 import { SessionStore } from '../src/session.mjs';
-import { buildRequestBody } from '../src/gateway.mjs';
-import { normalizeMessages } from '../src/openai.mjs';
-import { resolveModel } from '../src/models.mjs';
-import { checkBan, classify403 } from '../src/guard.mjs';
+import { checkBan } from '../src/guard.mjs';
+import { sendModelCallOnce } from '../src/probe.mjs';
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
@@ -114,78 +112,41 @@ try {
       console.log(`  … waiting ${gapMs / 1000}s`);
       await new Promise((resolve) => setTimeout(resolve, gapMs));
     }
-    const previous = { promptMode: config.promptMode, lane: config.lane, envelopeMode: config.envelopeMode };
-    config.promptMode = step.promptMode;
-    config.lane = step.lane;
-    config.envelopeMode = step.envelopeMode;
-
+    // Same call the gateway makes, through the same helper, so a ladder result and
+    // a matrix result and production traffic differ only in the variables under test.
     let record;
     try {
-      const messages = normalizeMessages([{ role: 'user', content: PROMPT }], { mode: step.promptMode });
-      const model = resolveModel('perch');
-      const runId = `ladder-${Date.now().toString(36)}`;
-      const body = buildRequestBody({
-        messages,
-        tools: null,
-        toolChoice: null,
-        maxTokens: 512,
-        temperature: 0.2,
-        stop: null,
-        model,
-        runId,
-        reasoning: null,
-        attribution: {
-          userId: slot.session?.userId ?? null,
-          workspaceId: process.env.PERCH_WORKSPACE_ID || null,
-          runId,
-          lane: step.lane,
-          source: 'cli',
-          billingMultiplier: null,
-        },
+      const got = await sendModelCallOnce({
+        baseUrl, token,
+        prompt: PROMPT,
+        mode: step.promptMode,
         lane: step.lane,
+        envelopeMode: step.envelopeMode,
+        userId: slot.session?.userId ?? null,
       });
-      const res = await fetch(`${baseUrl}/api/perch-terminal/model-call`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          Authorization: `Bearer ${token}`,
-          'User-Agent': config.userAgent,
-          'x-perch-locale': config.locale,
-          'x-perch-call-delta': '1',
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(180_000),
-      });
-      const raw = await res.text();
-      let payload = null;
-      try { payload = JSON.parse(raw); } catch { /* SSE stream */ }
-      const category = res.status === 403 ? classify403(payload) : null;
+      const body = got.body;
       record = {
         step: step.id,
         why: step.why,
-        status: res.status,
-        category,
-        errorCode: payload?.errorCode ?? null,
-        error: payload?.error ?? null,
+        status: got.status,
+        category: got.category,
+        errorCode: got.errorCode,
+        error: got.error,
         promptMode: step.promptMode,
         lane: step.lane,
         envelopeMode: step.envelopeMode,
+        ticket: got.ticket,
         sysLen: body.request.messages?.[0]?.content?.length ?? 0,
         roles: body.request.messages.map((m) => m.role),
         topKeys: Object.keys(body),
         requestKeys: Object.keys(body.request),
-        responseHead: raw.slice(0, 2000),
+        responseHead: got.raw.slice(0, 2000),
         body,
       };
-      console.log(`  ${step.id.padEnd(14)} → HTTP ${res.status}${category ? ` (${category})` : ''}${payload?.errorCode ? ` ${payload.errorCode}` : ''}`);
+      console.log(`  ${step.id.padEnd(14)} → HTTP ${got.status}${got.category ? ` (${got.category})` : ''}${got.errorCode ? ` ${got.errorCode}` : ''}`);
     } catch (error) {
       record = { step: step.id, why: step.why, status: 0, transportError: error.message };
       console.log(`  ${step.id.padEnd(14)} → transport error: ${error.message}`);
-    } finally {
-      config.promptMode = previous.promptMode;
-      config.lane = previous.lane;
-      config.envelopeMode = previous.envelopeMode;
     }
     results.push(record);
 

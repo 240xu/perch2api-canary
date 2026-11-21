@@ -30,10 +30,11 @@ import path from 'node:path';
 
 import { config } from '../src/config.mjs';
 import { SessionStore } from '../src/session.mjs';
+import { checkBan } from '../src/guard.mjs';
 import { buildRequestBody } from '../src/gateway.mjs';
 import { normalizeMessages } from '../src/openai.mjs';
 import { resolveModel } from '../src/models.mjs';
-import { checkBan, classify403 } from '../src/guard.mjs';
+import { sendModelCallOnce } from '../src/probe.mjs';
 import { PROMPT_MODES, PERCH_SYSTEM_PREFIX, PERCH_AGENTS_PREFIX } from '../src/perch-prefix.mjs';
 
 const args = process.argv.slice(2);
@@ -260,76 +261,35 @@ try {
       await new Promise((r) => setTimeout(r, gapMs));
       process.stdout.write('\r');
     }
-    const previous = { promptMode: config.promptMode, lane: config.lane, envelopeMode: config.envelopeMode };
-    config.promptMode = cell.mode;
-    config.lane = cell.lane;
-    config.envelopeMode = cell.envelope;
-
-    const started = Date.now();
+    // One call, built and sent exactly as the gateway builds and sends it. That
+    // shared path (`src/probe.mjs`) is what makes a cell's result comparable with
+    // production traffic — including the turn ticket and the run id it returns.
     let record;
     try {
-      const messages = normalizeMessages([{ role: 'user', content: prompt }], { mode: cell.mode });
-      const model = resolveModel('perch');
-      const runId = `matrix-${Date.now().toString(36)}-${index}`;
-      const body = buildRequestBody({
-        messages, tools: null, toolChoice: null, maxTokens: 512, temperature: 0.2, stop: null,
-        model, runId, reasoning: null,
-        attribution: {
-          userId: slot.session?.userId ?? null, workspaceId: process.env.PERCH_WORKSPACE_ID || null,
-          runId, lane: cell.lane, source: 'cli', billingMultiplier: null,
-        },
+      const got = await sendModelCallOnce({
+        baseUrl, token,
+        prompt,
+        mode: cell.mode,
         lane: cell.lane,
+        envelopeMode: cell.envelope,
+        userId: slot.session?.userId ?? null,
       });
-
-      const res = await fetch(`${baseUrl}/api/perch-terminal/model-call`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          Authorization: `Bearer ${token}`,
-          'User-Agent': config.userAgent,
-          'x-perch-locale': config.locale,
-          'x-perch-call-delta': '1',
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(180_000),
-      });
-
-      const raw = await res.text();
-      let payload = null;
-      try { payload = JSON.parse(raw); } catch { /* SSE */ }
-      const category = res.status === 403 ? classify403(payload) : null;
-      const firstDelta = (() => {
-        for (const line of raw.split('\n')) {
-          if (!line.startsWith('data:')) continue;
-          try {
-            const e = JSON.parse(line.slice(5).trim());
-            if (e.type === 'answer_delta' && e.text) return e.text;
-            if (e.type === 'done' && e.text) return e.text;
-          } catch { /* ignore */ }
-        }
-        return null;
-      })();
-
       record = {
         ...cell,
-        status: res.status,
-        category,
-        errorCode: payload?.errorCode ?? null,
-        error: payload?.error ?? null,
-        ms: Date.now() - started,
-        firstDelta,
-        body,
-        responseHead: raw.slice(0, 2000),
+        ticket: got.ticket,
+        status: got.status,
+        category: got.category,
+        errorCode: got.errorCode,
+        error: got.error,
+        ms: got.ms,
+        firstDelta: got.firstDelta,
+        body: got.body,
+        responseHead: got.raw.slice(0, 2000),
       };
-      console.log(`  ${cell.id.padEnd(30)} → ${res.status}${category ? ` ${category}` : ''}${payload?.errorCode ? ` ${payload.errorCode}` : ''} ${record.ms}ms${firstDelta ? ` "${firstDelta.slice(0, 40)}"` : ''}`);
+      console.log(`  ${cell.id.padEnd(30)} → ${got.status}${got.category ? ` ${got.category}` : ''}${got.errorCode ? ` ${got.errorCode}` : ''} ${got.ms}ms${got.firstDelta ? ` "${got.firstDelta.slice(0, 40)}"` : ''}`);
     } catch (error) {
-      record = { ...cell, status: 0, transportError: error.message, ms: Date.now() - started };
+      record = { ...cell, status: 0, transportError: error.message, ms: null };
       console.log(`  ${cell.id.padEnd(30)} → transport error: ${error.message}`);
-    } finally {
-      config.promptMode = previous.promptMode;
-      config.lane = previous.lane;
-      config.envelopeMode = previous.envelopeMode;
     }
     results.push(record);
 
